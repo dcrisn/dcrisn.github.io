@@ -22,7 +22,9 @@
         <link rel="alternate" type="text/html" href="https://dcrisn.github.io/asio-lifetimes/"/>
         <id>https://dcrisn.github.io/asio-lifetimes/</id>
         
-        <content type="html" xml:base="https://dcrisn.github.io/asio-lifetimes/"></content>
+        <summary type="html">&lt;p&gt;This article introduces the &lt;code&gt;Asio&lt;&#x2F;code&gt; library for convenient C++-native
+asynchronous programming and suggests an approach for solving common
+use-after-free bugs.&lt;&#x2F;p&gt;</summary>
         
     </entry>
 </feed>

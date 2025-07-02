@@ -8,6 +8,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
     
+    
+    <meta name="description" content="This article introduces the Asio library for convenient C++-native
+asynchronous programming and suggests an approach for solving common
+use-after-free bugs." />
+    <meta property="og:description" content="This article introduces the Asio library for convenient C++-native
+asynchronous programming and suggests an approach for solving common
+use-after-free bugs." />
+    <meta property="twitter:description" content="This article introduces the Asio library for convenient C++-native
+asynchronous programming and suggests an approach for solving common
+use-after-free bugs." />
+    
 
     <!-- Title -->
       
@@ -96,6 +107,8 @@
 
     <!-- additional scripts -->
     
+      
+        <script defer src="https://dcrisn.github.io/js/codeblock.js"></script>
       
       
         <script src="https://dcrisn.github.io/js/toggle-theme.js"></script>
@@ -226,7 +239,7 @@
         <circle cx="16" cy="16" r="14"/>
         <path d="M16 8 L16 16 20 20"/>
     </svg>
-    <data>0 minute read</data>
+    <data>20 minute read</data>
     <svg class="icon i-edit" viewBox="0 0 32 32"
          width="16" height="16" fill="none" stroke="currentcolor"
          stroke-linecap="round" stroke-linejoin="round" stroke-width="6.25%">
@@ -241,8 +254,931 @@
 
     <article itemprop="articleBody">
         
-            <!-- If no summary separate from content, just render content -->
+            <p>This article introduces the <code>Asio</code> library for convenient C++-native
+asynchronous programming and suggests an approach for solving common
+use-after-free bugs.</p>
+
             
+                <details class="toc-container">
+                    <summary class="toc-title">Table of Contents</summary>
+                    <ul class="toc-list">
+                        
+                            <li>
+                                <a href="https://dcrisn.github.io/asio-lifetimes/#quick-intro-to-asynchronous-input-output">Quick intro to Asynchronous Input&#x2F;Output</a>
+                                
+                            </li>
+                        
+                            <li>
+                                <a href="https://dcrisn.github.io/asio-lifetimes/#asio">Asio</a>
+                                
+                            </li>
+                        
+                            <li>
+                                <a href="https://dcrisn.github.io/asio-lifetimes/#brief-introduction-to-asio">Brief Introduction to asio</a>
+                                
+                            </li>
+                        
+                            <li>
+                                <a href="https://dcrisn.github.io/asio-lifetimes/#asio-lifetime-dependencies-and-use-after-free-cases">Asio Lifetime Dependencies and Use-After-Free Cases</a>
+                                
+                            </li>
+                        
+                            <li>
+                                <a href="https://dcrisn.github.io/asio-lifetimes/#lifetime-dependencies-in-general">Lifetime Dependencies in General</a>
+                                
+                            </li>
+                        
+                            <li>
+                                <a href="https://dcrisn.github.io/asio-lifetimes/#lifetime-utils">Lifetime Utils</a>
+                                
+                                    <ul>
+                                        
+                                            <li>
+                                                <a href="https://dcrisn.github.io/asio-lifetimes/#guard-lifetime">guard_lifetime()</a>
+                                            </li>
+                                            
+                                        
+                                            <li>
+                                                <a href="https://dcrisn.github.io/asio-lifetimes/#bind-lifetime">bind_lifetime()</a>
+                                            </li>
+                                            
+                                        
+                                    </ul>
+                                
+                            </li>
+                        
+                            <li>
+                                <a href="https://dcrisn.github.io/asio-lifetimes/#the-lifetime-pattern-applied">The Lifetime Pattern Applied</a>
+                                
+                            </li>
+                        
+                            <li>
+                                <a href="https://dcrisn.github.io/asio-lifetimes/#key-takeaways">Key Takeaways</a>
+                                
+                            </li>
+                        
+                    </ul>
+                </details>
+            
+
+            <!-- Render the rest of the content after removing the summary portion -->
+            
+<span id="continue-reading"></span><h2 id="quick-intro-to-asynchronous-input-output">Quick intro to Asynchronous <strong>I</strong>nput/<strong>O</strong>utput</h2>
+<p>Distributed applications that involve message passing over a network
+necessarily adopt non-blocking input/output. This is a natural consequence
+of the fact that such applications are IO-bound, rather than CPU-bound:
+rather than being continuously engaged in intensive computation, the CPU
+is mostly waiting for messages to be sent and received, limited by network
+delays, flow-control, congestion-control, and possibly other policy limits.</p>
+<p>This is illustrated in the following figure:</p>
+<pre style="background-color:#2b303b;color:#6c7079;"><code><span style="color:#abb2bf;">  Process A                Process B
+</span><span style="color:#abb2bf;">     |                          |
+</span><span style="color:#abb2bf;">  T  |---- Send Request -----&gt;  |   ← Message sent from A to B
+</span><span style="color:#abb2bf;">  |  |                          |
+</span><span style="color:#abb2bf;">  |  |==== WAITING (BLOCKED) ===|   ← A is idle, waiting for B
+</span><span style="color:#abb2bf;">  |  |                          |
+</span><span style="color:#abb2bf;">  T’ |&lt;---- Send Response  -----|   ← B finishes and replies
+</span><span style="color:#abb2bf;">     |                          |
+</span><span style="color:#abb2bf;">     v                          v
+</span></code></pre>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="font-style:italic;color:#5f697a;">/* pseudocode */
+</span><span style="color:#abb2bf;">response </span><span style="color:#adb7c9;">= </span><span style="color:#eb6772;">send</span><span style="color:#abb2bf;">(B, msg)  </span><span style="font-style:italic;color:#5f697a;">/* this takes (T’-T)time */
+</span><span style="color:#eb6772;">process_response</span><span style="color:#abb2bf;">(response)
+</span></code></pre>
+<p>If <code>A</code> made a <strong>blocking</strong> call, as shown above, as in the pure, original form
+of RPC<sup class="footnote-reference" id="fr-1-1"><a href="#fn-1">1</a></sup>, suspending execution of the current thread until a response was
+received or timeout occurred, then the CPU is doing virtually no work with
+respect to the thread of this application, between T and T’.
+The application will be put to sleep, and woken up when an interrupt is fired
+and the kernel stack has read bytes from the network interface destined for
+the socket that A is listening for a response on.</p>
+<p>What if <code>A</code> wanted to make another such call to <code>C</code>? Or make two or more
+calls at the same time to <code>B</code>? This simple model does not allow for such
+concurrency. Applications of any complexity will, however, almost always
+require concurrency as without it the performance would be unacceptable:
+<code>n</code> requests from <code>A</code> to <code>B</code> would take <code>n x (T’ - T)</code> time.</p>
+<p>If concurrency is required, one option would be to use <strong>threads</strong>. However,
+this solution does not scale well: <code>n</code> parallel blocking requests would
+require <code>n</code> threads. Additionally, there are system limits to the number
+of threads that can be spawned. More to the point, while threads would allow
+for <em>concurrency</em>, they would not speed up the application beyond that. For
+one thing, past a point, thread setup and teardown and scheduling add up to
+an overhead that must be considered. The crux of the matter however is that
+<em>most of the time is still spent <strong>waiting</strong> for data from the network</em>. The
+requests are generated and sent quickly by the sender, <code>A</code>. But then <code>A</code> must
+wait for a time that no amount of CPU power (and no number of threads) at <code>A</code>
+will change. This time is the <strong>response time</strong> of B and includes a number
+of delays: <code>transmission</code>, <code>propagation</code>, <code>queueing</code>, and <code>processing</code> delays
+at <code>A</code>, <code>B</code>, and all the hops on the network path in between. If a reliable
+protocol is used, the kernels may further have to act according to flow
+control, error control, and congestion control signals, all while the
+application task is sleeping and gets little to no CPU time.</p>
+<p>Threads therefore are a good concurrency solution when the threads themselves
+are relatively few in number, perform long-running, independent (to minimize
+need for synchronization) blocking tasks, and/or tasks that put the CPU to
+work continuously rather than keeping it idle.</p>
+<p>In situations such as the above however, where we have <em>bursty</em> CPU usage
+followed by relatively long periods of idling, another solution is appropriate.
+This is non-blocking,  asynchronous input/output. Concurrency here does not
+involve separate threads; instead, a single thread designs its control flow
+to be non-blocking and to react to events. <code>A</code> sends a request to <code>B</code> and does
+not block/suspend its thread, waiting for a response. Instead, it is free to
+send other requests and is notified when response data has arrived<sup class="footnote-reference" id="fr-2-1"><a href="#fn-2">2</a></sup>.
+Input and output (reads to and writes from the network socket) are interleaved.
+This achieves a concurrency model that is more suitable to the IO-bound nature
+of network applications. <code>A</code> – assuming it has work to do – can use the CPU
+between <code>T</code> and <code>T’</code> instead of leaving it idle while its thread is blocked.</p>
+<pre style="background-color:#2b303b;color:#6c7079;"><code><span style="color:#abb2bf;">  Process A                  Process B         Process C         Process D
+</span><span style="color:#abb2bf;">     |                            |                |                 |
+</span><span style="color:#abb2bf;">  T  |---- Send Request 1 -----&gt;  |                |                 |
+</span><span style="color:#abb2bf;">  |  |---- Send Request 2 --------|----------------|---------------&gt; |
+</span><span style="color:#abb2bf;">  |  |---- Send Request 3 --------|--------------&gt; |                 |
+</span><span style="color:#abb2bf;">  |  …                            …                …                 …   
+</span><span style="color:#abb2bf;">  |  |---- Send Request 4 —-----&gt; |                |                 |
+</span><span style="color:#abb2bf;">  |  …                            …                …                 …
+</span><span style="color:#abb2bf;">  |  | &lt;---- Response 2 —---------|----------------|---------------- |
+</span><span style="color:#abb2bf;">  |  | &lt;---- Response 3 —---------|----------------|                 |
+</span><span style="color:#abb2bf;">  |  …                            …                …                 …
+</span><span style="color:#abb2bf;">  |  |---- Send Request 5 --------|----------------|---------------&gt; |
+</span><span style="color:#abb2bf;">  |  | &lt;---- Response 4 —---------|                |                 |
+</span><span style="color:#abb2bf;">  T’ | &lt;---- Response 1 —---------|                |                 |
+</span><span style="color:#abb2bf;">     …                            …                …                 …
+</span><span style="color:#abb2bf;">     |                            |                |                 |
+</span><span style="color:#abb2bf;">     |                            |                |                 |
+</span><span style="color:#abb2bf;">     V                            V                V                 V
+</span></code></pre>
+<p>In the figure, the responses come out of order. This could be due to a number
+of reasons: reordering in the network (due to different round-trip-times,
+retransmissions etc), differing response times, prioritization policies at
+<code>B</code>, etc. Between <code>T</code> (time of sending <code>request 1</code>) and <code>T’</code> (time of getting
+the response to <code>request 1</code>), other work is done. The thread at <code>A</code> is not
+blocked.</p>
+<p>How might this be achieved?
+Operating systems typically make available an API for monitoring input-output
+events. Examples are <code>epoll</code> (or the older <code>poll</code> and <code>select</code> APIs) in <code>Linux</code>
+and <code>Kqueue</code> in the <code>BSD</code>s. In all such systems this boils down to providing
+an <code>API</code> for:</p>
+<ul>
+<li>registering interest in certain events (e.g. socket is readable, socket
+is writable, timer expired etc)<sup class="footnote-reference" id="fr-3-1"><a href="#fn-3">3</a></sup>.</li>
+<li>making a single blocking call that unblocks when any matching event (or
+maximum timeout) occurs.</li>
+</ul>
+<p>An example of this is given below<sup class="footnote-reference" id="fr-4-1"><a href="#fn-4">4</a></sup>.</p>
+<pre data-lang="C" style="background-color:#2b303b;color:#6c7079;" class="language-C "><code class="language-C" data-lang="C"><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(;;) {
+</span><span style="color:#abb2bf;">   </span><span style="font-style:italic;color:#5f697a;">// BLOCKS here.
+</span><span style="color:#abb2bf;">   nev </span><span style="color:#adb7c9;">= </span><span style="color:#eb6772;">kevent</span><span style="color:#abb2bf;">(kq, chlist, N, 
+</span><span style="color:#abb2bf;">                    evlist, N,
+</span><span style="color:#abb2bf;">                    </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">tmout);   </span><span style="font-style:italic;color:#5f697a;">/* set upper time limit to block */
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">   </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(nev </span><span style="color:#adb7c9;">== -</span><span style="color:#db9d63;">1</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">      </span><span style="color:#5ebfcc;">perror</span><span style="color:#abb2bf;">(</span><span style="color:#9acc76;">&quot;kevent()&quot;</span><span style="color:#abb2bf;">);
+</span><span style="color:#abb2bf;">      </span><span style="color:#5ebfcc;">exit</span><span style="color:#abb2bf;">(EXIT_FAILURE);
+</span><span style="color:#abb2bf;">   }
+</span><span style="color:#abb2bf;">   </span><span style="color:#cd74e8;">else if </span><span style="color:#abb2bf;">(nev </span><span style="color:#adb7c9;">== </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">      </span><span style="font-style:italic;color:#5f697a;">/* handle timeout */
+</span><span style="color:#abb2bf;">   }
+</span><span style="color:#abb2bf;">   </span><span style="color:#cd74e8;">else if </span><span style="color:#abb2bf;">(nev </span><span style="color:#adb7c9;">&gt; </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">      </span><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(i </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">; i </span><span style="color:#adb7c9;">&lt;</span><span style="color:#abb2bf;"> nev; i</span><span style="color:#adb7c9;">++</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">         </span><span style="font-style:italic;color:#5f697a;">/* handle events */
+</span><span style="color:#abb2bf;">      }
+</span><span style="color:#abb2bf;">   }
+</span><span style="color:#abb2bf;">}
+</span></code></pre>
+<p>The Linux epoll API<sup class="footnote-reference" id="fr-5-1"><a href="#fn-5">5</a></sup> is structurally similar.</p>
+<pre data-lang="C" style="background-color:#2b303b;color:#6c7079;" class="language-C "><code class="language-C" data-lang="C"><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(;;) {
+</span><span style="color:#abb2bf;">     nfds </span><span style="color:#adb7c9;">= </span><span style="color:#eb6772;">epoll_wait</span><span style="color:#abb2bf;">(epollfd, events, MAX_EVENTS, </span><span style="color:#adb7c9;">-</span><span style="color:#db9d63;">1</span><span style="color:#abb2bf;">);
+</span><span style="color:#abb2bf;">     </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(nfds </span><span style="color:#adb7c9;">== -</span><span style="color:#db9d63;">1</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">         </span><span style="color:#5ebfcc;">perror</span><span style="color:#abb2bf;">(</span><span style="color:#9acc76;">&quot;epoll_wait&quot;</span><span style="color:#abb2bf;">);
+</span><span style="color:#abb2bf;">         </span><span style="color:#5ebfcc;">exit</span><span style="color:#abb2bf;">(EXIT_FAILURE);
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="font-style:italic;color:#5f697a;">// ...
+</span><span style="color:#abb2bf;">    </span><span style="font-style:italic;color:#5f697a;">// Now look at each event that occured and handle it.
+</span><span style="color:#abb2bf;">}
+</span></code></pre>
+<p>The blocking call is typically made in an infinite loop. The events are tracked
+inside the kernel, which unblocks the thread and provides notifications when
+any events occurred. This does require the entire application to be modeled
+like an event loop. Is Socket x readable? Call the <code>read_bytes(x)</code> handler.
+Is socket y writable ? Send some bytes to y from the buffer.
+Because this article is not about epoll as such, I will forgo any extensive
+examples here.</p>
+<h2 id="asio">Asio</h2>
+<p>It would seem the story ends here. Epoll gives you what you need. Why use
+anything else?  While using <code>epoll</code> or <code>kqueue</code> directly is simple enough,
+it is:</p>
+<ul>
+<li>not portable. <code>epoll</code> is Linux-specific, <code>kqueue</code> is BSD-specific.</li>
+<li>boilerplate-heavy. Managing a single timer requires more calls than you
+might expect, using primitive POSIX calls, etc.</li>
+<li>a bare-bones C API. C is great for some things. Not so much for others.</li>
+</ul>
+<p>Various libraries are available to address the first two points: portability,
+and convenience. Some of them  are written in <code>C</code>, with bindings for other
+languages. Other languages offer modules for asynchronous programming as part
+of their standard library<sup class="footnote-reference" id="fr-6-1"><a href="#fn-6">6</a></sup>.</p>
+<p>The <code>C++</code> standard library currently has no APIs for asynchronous input-output
+(or for networking in general, for that matter). Instead you’ll either have
+to use the likes of <code>epoll</code> directly or hunt for some library. You <em>could</em> use
+one of these C libraries. But you would soon find yourself writing wrappers
+everywhere to <em>C++-ify</em> the API. You will want <code>RAII</code>, constructors,
+<code>std::chrono</code>-compatible interfaces, generic programming to maximize code reuse,
+smart pointers, and so on. Macros, const-correctness, C-style casts, void
+pointer manipulation, etc. may cause some compilation pain or will need to be
+"quarantined" behind an isolated adaptor layer lest it ‘infects’ the entire
+C++ codebase. And so you will find yourself building another library on top of
+your dependency.</p>
+<p>But luckily there is no need for that. Luckily, there is already a
+well-established battle-tested <code>C++</code> library for asynchronous network
+programming: <strong><code>asio</code></strong><sup class="footnote-reference" id="fr-7-1"><a href="#fn-7">7</a></sup>. This wraps the likes of OS APIs like <code>epoll</code>
+(depending on the platform) and gives you a higher-level, <code>C++</code>-native API.</p>
+<h2 id="brief-introduction-to-asio">Brief Introduction to asio</h2>
+<p>A minimal example of <code>asio</code> is given below.</p>
+<p>For simplicity assume we have a server talking to clients over <code>TCP</code>.
+Whenever a <code>TCP</code> connection is accepted, the server creates a <em>connection</em> object
+that encapsulates various state variables, timers for application-layer
+timeouts etc. Assume the server expects to receive heartbeats at the
+application layer for liveness. If not received within a certain interval,
+the server tears down the connection object and throws it away.</p>
+<p>Below is a simple demonstrative code example<sup class="footnote-reference" id="fr-8-1"><a href="#fn-8">8</a></sup>. We create <code>N</code> connection
+objects which contain a timer to check for incoming heartbeats. We send a
+certain number of heartbeats (simulating their arrival from the network).
+After a short time we stop sending heartbeats, which the connection objects
+detect and signal. The objects are discarded.
+We also use <code>sigc::signals</code><sup class="footnote-reference" id="fr-9-1"><a href="#fn-9">9</a></sup>, often found in this sort of event-driven
+code, to propagate events (<em>signals</em>) to outer handlers, using
+the observer pattern<sup class="footnote-reference" id="fr-10-1"><a href="#fn-10">10</a></sup>.</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#cd74e8;">#include </span><span style="color:#9acc76;">&lt;boost/asio.hpp&gt;
+</span><span style="color:#cd74e8;">#include </span><span style="color:#9acc76;">&lt;boost/asio/posix/basic_stream_descriptor.hpp&gt;
+</span><span style="color:#cd74e8;">#include </span><span style="color:#9acc76;">&lt;sigc++/signal.h&gt;
+</span><span style="color:#abb2bf;">
+</span><span style="font-style:italic;color:#5f697a;">// NOTE: asio can be easily used standalone without boost as well.
+</span><span style="color:#cd74e8;">namespace </span><span style="color:#abb2bf;">asio </span><span style="color:#adb7c9;">=</span><span style="color:#abb2bf;"> boost::asio;
+</span><span style="color:#cd74e8;">using namespace</span><span style="color:#abb2bf;"> std::chrono_literals;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">class </span><span style="color:#f0c678;">connection </span><span style="color:#adb7c9;">{
+</span><span style="color:#cd74e8;">public</span><span style="color:#adb7c9;">:
+</span><span style="color:#adb7c9;">    </span><span style="color:#5cb3fa;">connection</span><span style="color:#adb7c9;">(asio::io_context &amp;</span><span style="color:#eb6772;">ioctx</span><span style="color:#adb7c9;">) : </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">(ioctx) {}
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">start</span><span style="color:#adb7c9;">() { </span><span style="color:#eb6772;">restart_heartbeat_monitor</span><span style="color:#adb7c9;">(); }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">close</span><span style="color:#adb7c9;">() { </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">cancel</span><span style="color:#adb7c9;">(); }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">virtual </span><span style="color:#5cb3fa;">~connection</span><span style="color:#adb7c9;">() { std::cerr &lt;&lt; </span><span style="color:#9acc76;">&quot;connection destroyed</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#adb7c9;">; }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">restart_heartbeat_monitor</span><span style="color:#adb7c9;">() {
+</span><span style="color:#adb7c9;">        </span><span style="font-style:italic;color:#5f697a;">// Any pending async waits will be canceled.
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">expires_after</span><span style="color:#adb7c9;">(</span><span style="color:#eb6772;">m_HEARTBEAT_INTERVAL</span><span style="color:#adb7c9;">);
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">        </span><span style="font-style:italic;color:#5f697a;">// call handler on timeout or cancellation
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">async_wait</span><span style="color:#adb7c9;">([</span><span style="color:#eb6772;">this</span><span style="color:#adb7c9;">](std::error_code ec) {
+</span><span style="color:#adb7c9;">            </span><span style="color:#cd74e8;">if </span><span style="color:#adb7c9;">(ec) {
+</span><span style="color:#adb7c9;">                </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">emit</span><span style="color:#adb7c9;">(ec.</span><span style="color:#eb6772;">message</span><span style="color:#adb7c9;">());
+</span><span style="color:#adb7c9;">                </span><span style="color:#cd74e8;">return</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">            }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">            </span><span style="color:#eb6772;">on_heartbeat_timeout</span><span style="color:#adb7c9;">();
+</span><span style="color:#adb7c9;">        });
+</span><span style="color:#adb7c9;">    };
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">on_heartbeat_received</span><span style="color:#adb7c9;">() {
+</span><span style="color:#adb7c9;">        std::cerr &lt;&lt; </span><span style="color:#9acc76;">&quot;Heartbeat received, restarting monitor.&quot; </span><span style="color:#adb7c9;">&lt;&lt; std::endl;
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">restart_heartbeat_monitor</span><span style="color:#adb7c9;">();
+</span><span style="color:#adb7c9;">    }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">on_heartbeat_timeout</span><span style="color:#adb7c9;">() {
+</span><span style="color:#adb7c9;">        std::cerr &lt;&lt; </span><span style="color:#9acc76;">&quot;heartbeat timeout!!</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">close</span><span style="color:#adb7c9;">();
+</span><span style="color:#adb7c9;">    }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">static auto </span><span style="color:#5cb3fa;">heartbeat_interval</span><span style="color:#adb7c9;">() { </span><span style="color:#cd74e8;">return </span><span style="color:#eb6772;">m_HEARTBEAT_INTERVAL</span><span style="color:#adb7c9;">; }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#cd74e8;">private</span><span style="color:#adb7c9;">:
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">static inline constexpr</span><span style="color:#adb7c9;"> std::chrono::milliseconds m_HEARTBEAT_INTERVAL {
+</span><span style="color:#adb7c9;">      </span><span style="color:#db9d63;">100</span><span style="color:#adb7c9;">};
+</span><span style="color:#adb7c9;">    boost::asio::high_resolution_timer </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">    sigc::signal&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#adb7c9;">(</span><span style="color:#cd74e8;">const</span><span style="color:#adb7c9;"> std::string &amp;)&gt; </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">}</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">int </span><span style="color:#5cb3fa;">main</span><span style="color:#abb2bf;">(</span><span style="color:#eb6772;">int</span><span style="color:#abb2bf;">, </span><span style="color:#cd74e8;">const char </span><span style="color:#adb7c9;">**</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">using </span><span style="color:#abb2bf;">connection_id_t </span><span style="color:#adb7c9;">=</span><span style="color:#abb2bf;"> std::uint32_t;
+</span><span style="color:#abb2bf;">    std::map&lt;connection_id_t, std::shared_ptr&lt;connection&gt;&gt; live_conns;
+</span><span style="color:#abb2bf;">    std::uint32_t next_connection_id </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">constexpr</span><span style="color:#abb2bf;"> std::size_t NUM_CONNS </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">5</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">unsigned</span><span style="color:#abb2bf;"> NUM_HEARTBEATS </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">5</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    asio::io_context ioctx;
+</span><span style="color:#abb2bf;">    asio::high_resolution_timer </span><span style="color:#eb6772;">heartbeat_pump_timer </span><span style="color:#abb2bf;">{ioctx};
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">const</span><span style="color:#abb2bf;"> std::function&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">)&gt; wait_send_next_heartbeat </span><span style="color:#adb7c9;">=
+</span><span style="color:#abb2bf;">      [</span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">live_conns,
+</span><span style="color:#abb2bf;">       </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">timer </span><span style="color:#adb7c9;">=</span><span style="color:#abb2bf;"> heartbeat_pump_timer,
+</span><span style="color:#abb2bf;">       </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">wait_send_next_heartbeat,
+</span><span style="color:#abb2bf;">       </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">NUM_HEARTBEATS] {
+</span><span style="color:#abb2bf;">          </span><span style="font-style:italic;color:#5f697a;">// we only send NUM_HEARTBEATS; after that we make
+</span><span style="color:#abb2bf;">          </span><span style="font-style:italic;color:#5f697a;">// a close on the connection and throw it away.
+</span><span style="color:#abb2bf;">          std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;num heartbeats is &quot; </span><span style="color:#adb7c9;">&lt;&lt;</span><span style="color:#abb2bf;"> NUM_HEARTBEATS </span><span style="color:#adb7c9;">&lt;&lt;</span><span style="color:#abb2bf;"> std::endl;
+</span><span style="color:#abb2bf;">          </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(NUM_HEARTBEATS</span><span style="color:#adb7c9;">-- &lt;= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">              std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;clearing connections</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">              </span><span style="font-style:italic;color:#5f697a;">// Here, clear only HALF the connections; leaving some
+</span><span style="color:#abb2bf;">              </span><span style="font-style:italic;color:#5f697a;">// alone.
+</span><span style="color:#abb2bf;">              </span><span style="color:#cd74e8;">const auto</span><span style="color:#abb2bf;"> sz </span><span style="color:#adb7c9;">=</span><span style="color:#abb2bf;"> live_conns.</span><span style="color:#eb6772;">size</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">              </span><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">unsigned</span><span style="color:#abb2bf;"> i </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">; i </span><span style="color:#adb7c9;">&lt;</span><span style="color:#abb2bf;"> sz </span><span style="color:#adb7c9;">/ </span><span style="color:#db9d63;">2</span><span style="color:#abb2bf;">; </span><span style="color:#adb7c9;">++</span><span style="color:#abb2bf;">i) {
+</span><span style="color:#abb2bf;">                  live_conns.</span><span style="color:#eb6772;">erase</span><span style="color:#abb2bf;">(live_conns.</span><span style="color:#eb6772;">begin</span><span style="color:#abb2bf;">());
+</span><span style="color:#abb2bf;">              }
+</span><span style="color:#abb2bf;">              </span><span style="color:#cd74e8;">return</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">          }
+</span><span style="color:#abb2bf;">          timer.</span><span style="color:#eb6772;">expires_after</span><span style="color:#abb2bf;">(connection::</span><span style="color:#eb6772;">heartbeat_interval</span><span style="color:#abb2bf;">() </span><span style="color:#adb7c9;">/ </span><span style="color:#db9d63;">2</span><span style="color:#abb2bf;">);
+</span><span style="color:#abb2bf;">          timer.</span><span style="color:#eb6772;">async_wait</span><span style="color:#abb2bf;">(
+</span><span style="color:#abb2bf;">            [</span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">live_conns, </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">wait_send_next_heartbeat](std::error_code ec) {
+</span><span style="color:#abb2bf;">                </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(ec.</span><span style="color:#eb6772;">value</span><span style="color:#abb2bf;">() </span><span style="color:#adb7c9;">==</span><span style="color:#abb2bf;"> asio::error::operation_aborted) {
+</span><span style="color:#abb2bf;">                    std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;wait_send_next_heartbeat operation aborted</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">                    </span><span style="color:#cd74e8;">return</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">                }
+</span><span style="color:#abb2bf;">                </span><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">const auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">[connid, conn] </span><span style="color:#adb7c9;">:</span><span style="color:#abb2bf;"> live_conns) {
+</span><span style="color:#abb2bf;">                    std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;sending Heartbeat</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">                    conn-&gt;</span><span style="color:#eb6772;">on_heartbeat_received</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">                }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">                </span><span style="color:#eb6772;">wait_send_next_heartbeat</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">            });
+</span><span style="color:#abb2bf;">      };
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(std::size_t i </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">; i </span><span style="color:#adb7c9;">&lt;</span><span style="color:#abb2bf;"> NUM_CONNS; </span><span style="color:#adb7c9;">++</span><span style="color:#abb2bf;">i) {
+</span><span style="color:#abb2bf;">        </span><span style="color:#cd74e8;">const auto</span><span style="color:#abb2bf;"> id </span><span style="color:#adb7c9;">= ++</span><span style="color:#abb2bf;">next_connection_id;
+</span><span style="color:#abb2bf;">        </span><span style="color:#cd74e8;">auto</span><span style="color:#abb2bf;"> conn </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">make_shared</span><span style="color:#abb2bf;">&lt;connection&gt;(ioctx);
+</span><span style="color:#abb2bf;">        live_conns[id] </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">move</span><span style="color:#abb2bf;">(conn);
+</span><span style="color:#abb2bf;">    }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    std::</span><span style="color:#eb6772;">for_each</span><span style="color:#abb2bf;">(live_conns.</span><span style="color:#eb6772;">begin</span><span style="color:#abb2bf;">(), live_conns.</span><span style="color:#eb6772;">end</span><span style="color:#abb2bf;">(), [](</span><span style="color:#cd74e8;">auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">elem) {
+</span><span style="color:#abb2bf;">        elem.</span><span style="color:#eb6772;">second</span><span style="color:#abb2bf;">-&gt;</span><span style="color:#eb6772;">start</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">    });
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#eb6772;">wait_send_next_heartbeat</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">    ioctx.</span><span style="color:#eb6772;">run_for</span><span style="color:#abb2bf;">(</span><span style="color:#db9d63;">1</span><span style="color:#cd74e8;">s</span><span style="color:#abb2bf;">);
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;NUM nondestructed live_conns: &quot; </span><span style="color:#adb7c9;">&lt;&lt;</span><span style="color:#abb2bf;"> live_conns.</span><span style="color:#eb6772;">size</span><span style="color:#abb2bf;">()
+</span><span style="color:#abb2bf;">              </span><span style="color:#adb7c9;">&lt;&lt;</span><span style="color:#abb2bf;"> std::endl;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">return </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">}
+</span></code></pre>
+<p>While this example is contrived, a few things should nevertheless be apparent:</p>
+<ul>
+<li>in addition to portability, the code is much more convenient than dealing
+with e.g. <code>epoll</code> directly. One can use <code>std::chrono</code>, <code>c++</code> lambdas, etc.</li>
+<li>the code is typically callback-driven. It must be structured in such a way
+that handlers are registered to run in response to events. In particular
+you schedule handlers to react to event notifications (reactor-style,
+invoke callback when <code>fd</code> readable) or to <em>completions of actions</em> (proactor
+pattern, e.g. invoke handler when bytes have been read into a buffer
+from a readable socket).</li>
+<li>asio objects are typically embedded in user objects and they get constructed
+with a reference to an <code>asio::io_context</code> (which wraps a scheduler i.e. all
+the glue to interface with the likes of epoll)</li>
+</ul>
+<p>I think it would generally be safe to say that once you get the hang of it,
+it's a relatively nice productive interface to work with from <code>C++</code>,
+generally preferable to the alternative of using <code>C</code> APIs.</p>
+<p>There are also some things that will very likely be less obvious: namely,
+<strong>the example contains <em>at least</em> 2 use-after-free memory violations, and the
+potential for more</strong>.</p>
+<h2 id="asio-lifetime-dependencies-and-use-after-free-cases">Asio Lifetime Dependencies and Use-After-Free Cases</h2>
+<p>Asio unfortunately implicitly assumes certain contracts related to the
+lifetime of objects -- that are not necessarily obvious and often undocumented.</p>
+<p>The first problem occurs here:</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#eb6772;">m_timer</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">async_wait</span><span style="color:#abb2bf;">([</span><span style="color:#eb6772;">this</span><span style="color:#abb2bf;">](std::error_code ec) {
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(ec) {
+</span><span style="color:#abb2bf;">        </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">emit</span><span style="color:#abb2bf;">(ec.</span><span style="color:#eb6772;">message</span><span style="color:#abb2bf;">());
+</span><span style="color:#abb2bf;">        </span><span style="color:#cd74e8;">return</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">    }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#eb6772;">on_heartbeat_timeout</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">});
+</span></code></pre>
+<p>This callback will be called with a non-zero error code <code>ec</code> on error or
+cancellation (<code>error::operation_aborted</code>). However, it may be invoked <em>after</em>
+the connection object (and its <code>m_timer</code> member) have been destructed. If
+the handler was scheduled for execution, and <code>cancel()</code> is called, asio will
+still  invoke the handler (unless it can be removed from the scheduler queue)
+with the <code>operation aborted</code> error code. In the current example, because
+we erase some connection objects from the <code>live_conns</code> map, removing the
+only <code>std::shared_ptr</code> keeping them alive, those objects are destructed. When
+the lambda runs, it emits a <code>sigc</code> signal (<code>this-&gt;m_sig_error.emit()</code>), thus
+using a member (accessing memory) of an object that has been destructed.
+<strong>Use after Free</strong>.</p>
+<p>We could do this instead:</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#eb6772;">m_timer</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">async_wait</span><span style="color:#abb2bf;">([</span><span style="color:#eb6772;">this</span><span style="color:#abb2bf;">](std::error_code ec) {
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(ec) {
+</span><span style="color:#abb2bf;">        </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(ec </span><span style="color:#adb7c9;">==</span><span style="color:#abb2bf;"> asio::error::operation_aborted){
+</span><span style="color:#abb2bf;">           </span><span style="color:#cd74e8;">return</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">        }
+</span><span style="color:#abb2bf;">        </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">emit</span><span style="color:#abb2bf;">(ec.</span><span style="color:#eb6772;">message</span><span style="color:#abb2bf;">());
+</span><span style="color:#abb2bf;">        </span><span style="color:#cd74e8;">return</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">    }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#eb6772;">on_heartbeat_timeout</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">});
+</span></code></pre>
+<p>This <strong>does not</strong> commit use-after-free — at least in my current setup
+with the current asio version I’m using for the example<sup class="footnote-reference" id="fr-8-2"><a href="#fn-8">8</a></sup>.
+The lambda gets invoked and returns if the <code>operation aborted</code> error code
+is set. No members of the destructed object are touched, no invalid memory
+reads occur. This is <em>even though the <code>asio::high_resolution_timer</code> m_timer
+member object, which the handler was scheduled through, has been destructed</em>.
+<code>Valgrind</code> and <code>sanitizers</code> do <em>not</em> flag this as a violation, and a <code>GDB</code>
+trace appears to suggest the handler is decoupled from the <code>asio</code> object
+that it was scheduled through (<code>asio::high_resolution_timer</code>) once enqueued
+into <code>asio</code>’s scheduler task queue inside the <code>asio::io_context</code>. So no
+use-after-free happens inside the asio machinery itself. However, if this
+is not already undefined behavior within the context of asio’s API,
+it may be hovering dangerously close to it.</p>
+<p>We then have another problem. The asio objects (e.g. <code>high_resolution_timer</code>),
+which, as mentioned, get constructed with a reference to the <code>asio::io_context</code>,
+call back into the context in their destructor. In other words, <em>it is
+assumed all asio objects are outlived by the context</em>. If this is not the case …
+well, there’s probably going to be a crash. Above, we arrange for the
+<code>io_context</code> to go out of scope before some of the connection objects get
+destructed, by keeping the connection objects in <code>std::shared_ptr</code>s. When
+these finally go out of scope, they’ll be committing use-after-free in their
+destructor by calling into the <code>asio::io_context</code>. This situation may be rare,
+but if objects get stored in a buffer or queue or get passed between threads,
+out-of-order destruction like this can well occur in practice.</p>
+<h2 id="lifetime-dependencies-in-general">Lifetime Dependencies in General</h2>
+<p>The ‘asio idiom’ for solving the use-after-free situations above is to have
+any class that embeds an asio object such as <code>asio::high_resolution_timer</code>
+inherit from <code>std::enable_shared_from_this</code> and be constructed as
+<code>std::shared_ptr</code>s. The objects, when registering a lambda-based handler, will
+then capture <code>shared_from_this()</code> by value in the lambda. This ensures the
+object remains alive at least until the lambda returns. Therefore
+use-after-free is precluded inside the lambda since when it gets invoked
+the object is guaranteed to be alive:</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#eb6772;">m_timer</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">async_wait</span><span style="color:#abb2bf;">([</span><span style="color:#eb6772;">this</span><span style="color:#abb2bf;">, self</span><span style="color:#adb7c9;">=</span><span style="color:#eb6772;">shared_from_this</span><span style="color:#abb2bf;">()](std::error_code ec) {
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(ec) {
+</span><span style="color:#abb2bf;">        </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">emit</span><span style="color:#abb2bf;">(ec.</span><span style="color:#eb6772;">message</span><span style="color:#abb2bf;">());
+</span><span style="color:#abb2bf;">        </span><span style="color:#cd74e8;">return</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">    }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#eb6772;">on_heartbeat_timeout</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">});
+</span></code></pre>
+<p>To address the other use-after-free instance, the <code>io_context</code> can be stored as
+a <code>std::shared_ptr</code> member (<code>m_ioctx</code>) inside the <em>connection</em> class, ensuring
+a connection object does not outlive its associated <code>io_context</code>.</p>
+<p>While these appear to solve the problem, we now have another one. When
+<code>m_sig_error.emit()</code> runs, invoking all the signal handlers (callbacks)
+connected to it by ‘observers’, we have fresh opportunities for use-after-free.
+Consider the following case (assume the connection object has been updated for
+the example).</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#cd74e8;">struct </span><span style="color:#abb2bf;">connection_wrapper{
+</span><span style="color:#abb2bf;">   </span><span style="color:#5cb3fa;">connection_wrapper</span><span style="color:#abb2bf;">(std::shared_ptr&lt;asio::io_context&gt; </span><span style="color:#eb6772;">ioctx</span><span style="color:#abb2bf;">){
+</span><span style="color:#abb2bf;">      </span><span style="color:#eb6772;">m_conn </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">make_shared</span><span style="color:#abb2bf;">&lt;connection&gt;(std::</span><span style="color:#eb6772;">move</span><span style="color:#abb2bf;">(ioctx));
+</span><span style="color:#abb2bf;">      </span><span style="color:#eb6772;">m_conn</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">signal_error</span><span style="color:#abb2bf;">().</span><span style="color:#eb6772;">connect</span><span style="color:#abb2bf;">([</span><span style="color:#eb6772;">this</span><span style="color:#abb2bf;">](</span><span style="color:#cd74e8;">const auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">e){
+</span><span style="color:#abb2bf;">         </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">emit</span><span style="color:#abb2bf;">(e);
+</span><span style="color:#abb2bf;">      }
+</span><span style="color:#abb2bf;">    </span><span style="background-color:#e05252;color:#ffffff;">}</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">private</span><span style="color:#adb7c9;">:
+</span><span style="color:#abb2bf;">   std::shared_ptr&lt;connection&gt; </span><span style="color:#eb6772;">m_conn</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">   sigc::signal</span><span style="color:#adb7c9;">&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">const</span><span style="color:#abb2bf;"> std::string </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">)</span><span style="color:#adb7c9;">&gt; </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#abb2bf;">;
+</span><span style="background-color:#e05252;color:#ffffff;">}</span><span style="color:#abb2bf;">;
+</span></code></pre>
+<p>A wrapper object here stores a <em>connection</em> object, connects to its error
+<code>sigc::signal</code>, and propagates it outward. The code looks benign. Yet,
+<strong>because <code>m_conn</code> is a <code>std::shared_ptr</code>, its lifetime is now decoupled
+from the lifetime of the outer, parent object</strong> (<code>connection_wrapper</code>).
+Because <code>m_conn</code> could’ve scheduled some callbacks via its
+<code>asio::high_resolution_timer</code>, it could be that a <code>connection_wrapper</code> object
+gets destructed before <code>m_conn</code>, due to <code>m_conn</code> being kept alive by the
+<code>shared_from_this()</code> captured in the lambda passed to asio for the handler!</p>
+<p>So now we need to prevent the signal handler connected to the error signal
+of <code>m_conn</code> from calling into the <code>connection_wrapper</code> object if the
+<code>connection_wrapper</code> object has been destructed. But how? We have to make the
+<code>connection_wrapper</code> itself a <code>std::shared_ptr</code>, and capture a <code>std::weak_ptr</code>
+inside the signal handler, lock it, and if expired, return early.</p>
+<hr />
+<p>We can see here the lifetime issue is in fact not asio-specific, but in fact
+general to asynchronous, event-driven, callback-heavy code.</p>
+<hr />
+<p>It becomes difficult to destruct objects while ensuring use-after-free
+violations do not occur. Worse, the pendulum can swing the other way: if in
+one’s eagerness to prevent use-after-free one were to use a <code>std::shared_ptr</code>
+where a <code>std::weak_ptr</code> should be used,a memory leak will occur instead.
+Consider the following:</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#abb2bf;"> </span><span style="color:#cd74e8;">struct </span><span style="color:#abb2bf;">connection_wrapper: </span><span style="color:#cd74e8;">public </span><span style="color:#9acc76;">std::enable_shared_from_this</span><span style="color:#abb2bf;">&lt;connection_wrapper&gt;{
+</span><span style="color:#abb2bf;">   </span><span style="color:#5cb3fa;">connection_wrapper</span><span style="color:#abb2bf;">(std::shared_ptr&lt;asio::io_context&gt; </span><span style="color:#eb6772;">ioctx</span><span style="color:#abb2bf;">){
+</span><span style="color:#abb2bf;">      </span><span style="color:#eb6772;">m_conn </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">make_shared</span><span style="color:#abb2bf;">&lt;connection&gt;(std::</span><span style="color:#eb6772;">move</span><span style="color:#abb2bf;">(ioctx));
+</span><span style="color:#abb2bf;">      </span><span style="color:#eb6772;">m_conn</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">signal_error</span><span style="color:#abb2bf;">().</span><span style="color:#eb6772;">connect</span><span style="color:#abb2bf;">([</span><span style="color:#eb6772;">this</span><span style="color:#abb2bf;">, self</span><span style="color:#adb7c9;">=</span><span style="color:#eb6772;">shared_from_this</span><span style="color:#abb2bf;">()](</span><span style="color:#cd74e8;">const auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">e){
+</span><span style="color:#abb2bf;">         </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">emit</span><span style="color:#abb2bf;">(e);
+</span><span style="color:#abb2bf;">      };
+</span><span style="background-color:#e05252;color:#ffffff;">}</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">private</span><span style="color:#adb7c9;">:
+</span><span style="color:#abb2bf;">   std::shared_ptr&lt;connection&gt; </span><span style="color:#eb6772;">m_conn</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">   sigc::signal</span><span style="color:#adb7c9;">&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">const</span><span style="color:#abb2bf;"> std::string </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">)</span><span style="color:#adb7c9;">&gt; </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#abb2bf;">;
+</span><span style="background-color:#e05252;color:#ffffff;">}</span><span style="color:#abb2bf;">;
+</span></code></pre>
+<p>Here, the <code>connection_wrapper</code> will be kept alive inside the signal handler
+connected to the connection object’s <code>sigc::signal</code> (<code>m_sig_error</code>) due to
+being captured as a <code>std::shared_ptr</code> in a lambda. Because the connection
+object is also stored as a <code>std::shared_ptr</code> inside the <code>connection_wrapper</code>
+object, neither will ever be destructed, producing a memory leak.
+<code>std::weak_ptr</code> is meant for this type of scenario, breaking the circular
+dependency.</p>
+<p>Correct handling therefore requires care and due consideration to the lifetime
+of the objects involved, and how <strong>the use of <code>std::shared_ptr</code> may further
+complicate matters due to decoupling the lifetime of member objects from the
+lifetime of parent objects.</strong></p>
+<p>One can do this manually everywhere, but we might be able to do
+a tiny bit better.</p>
+<h2 id="lifetime-utils">Lifetime Utils</h2>
+<p>To avoid the potentially error-prone approach described above, the risk
+can be minimized by abstracting these measures into a small suite of
+utilities and applying the pattern obviously and consistently.<sup class="footnote-reference" id="fr-11-1"><a href="#fn-11">11</a></sup></p>
+<p>The first observation is that <strong>decoupling the lifetime of a member object
+from the lifetime of the parent may not be a great idea</strong>, especially where
+the parent registers callbacks with such internal objects. If there are
+many such members, it soon becomes confusing.
+In fact, given a hierarchy of such objects where signals are emitted and
+propagated outward by outer objects, if the member objects are decoupled
+from the lifetime of their parents then every single layer must be guarded
+against use-after-free. This adds overhead in execution time, memory,
+and readability, and is more error prone.</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#cd74e8;">struct </span><span style="color:#abb2bf;">foo{
+</span><span style="color:#abb2bf;">    sigc::signal&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">)&gt; signal;
+</span><span style="color:#abb2bf;">};
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">struct </span><span style="color:#abb2bf;">bar {
+</span><span style="color:#abb2bf;">    </span><span style="color:#5cb3fa;">bar</span><span style="color:#abb2bf;">(){
+</span><span style="color:#abb2bf;">        </span><span style="color:#eb6772;">m_foo </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">make_shared</span><span style="color:#abb2bf;">&lt;foo&gt;();
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">        </span><span style="font-style:italic;color:#5f697a;">// m_foo may be destructed after *this* here;
+</span><span style="color:#abb2bf;">        </span><span style="font-style:italic;color:#5f697a;">// use-after-free daneger;
+</span><span style="color:#abb2bf;">        </span><span style="font-style:italic;color:#5f697a;">// must guard with std::weak_ptr.
+</span><span style="color:#abb2bf;">        </span><span style="color:#eb6772;">m_foo</span><span style="color:#abb2bf;">-&gt;</span><span style="color:#eb6772;">signal</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">connect</span><span style="color:#abb2bf;">([</span><span style="color:#eb6772;">this</span><span style="color:#abb2bf;">]{
+</span><span style="color:#abb2bf;">            signal.</span><span style="color:#eb6772;">emit</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">        });
+</span><span style="color:#abb2bf;">    }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    std::shared_ptr&lt;foo&gt; </span><span style="color:#eb6772;">m_foo</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">    sigc::signal&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">)&gt; signal;
+</span><span style="color:#abb2bf;">};
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">struct </span><span style="color:#abb2bf;">foobar{
+</span><span style="color:#abb2bf;">    </span><span style="color:#5cb3fa;">foobar</span><span style="color:#abb2bf;">(){
+</span><span style="color:#abb2bf;">        </span><span style="color:#eb6772;">m_bar </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">make_shared</span><span style="color:#abb2bf;">&lt;bar&gt;();
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">        </span><span style="font-style:italic;color:#5f697a;">// m_bar may be destructed after *this* here;
+</span><span style="color:#abb2bf;">        </span><span style="font-style:italic;color:#5f697a;">// use-after-free danger;
+</span><span style="color:#abb2bf;">        </span><span style="font-style:italic;color:#5f697a;">// must guard with std::weak_ptr.
+</span><span style="color:#abb2bf;">        </span><span style="color:#eb6772;">m_bar</span><span style="color:#abb2bf;">-&gt;</span><span style="color:#eb6772;">signal</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">connect</span><span style="color:#abb2bf;">([</span><span style="color:#eb6772;">this</span><span style="color:#abb2bf;">]{
+</span><span style="color:#abb2bf;">            </span><span style="color:#eb6772;">on_signal</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">        });
+</span><span style="color:#abb2bf;">    }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">on_signal</span><span style="color:#abb2bf;">(){}
+</span><span style="color:#abb2bf;">    std::shared_ptr&lt;bar&gt; </span><span style="color:#eb6772;">m_bar</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">};
+</span><span style="color:#abb2bf;">
+</span><span style="color:#adb7c9;">...
+</span><span style="color:#cd74e8;">auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">foo </span><span style="color:#adb7c9;">= </span><span style="color:#eb6772;">get_foo_from_somewhere</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">
+</span><span style="font-style:italic;color:#5f697a;">// calls the bar (which may have been destructed) handler,
+</span><span style="font-style:italic;color:#5f697a;">// which calls the foobar (which may have been destructed) handler.
+</span><span style="color:#abb2bf;">foo.</span><span style="color:#eb6772;">signal</span><span style="color:#abb2bf;">.</span><span style="color:#eb6772;">emit</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">
+</span></code></pre>
+<p>Second, because each such object must store the <code>asio::io_context</code> as a
+<code>std::shared_ptr</code> to avoid one of the use-after-free problems originally
+covered (and possibly other ‘context’ it depends on), there is also added
+overhead per each such object.</p>
+<p>Instead, we may proceed as follows:</p>
+<ul>
+<li>identify the outermost parent object that contains all these asynchronous
+<code>asio</code> objects (or other types of similar ‘async’ objects).</li>
+<li>make this object inherit <code>std::from enable_shared_from_this</code>.</li>
+<li>keep all the async members (e.g. connection) that may call back into the
+parent, as <em>value members</em> (for lack of a better term), as opposed to members
+that are references, pointers, or smart pointers. Similarly and recursively,
+connection (and all such classes having asio object members) will store asio
+objects or other such async objects as <em>value members</em>.</li>
+<li>with this, no nested object may outlive the outermost parent object. In other
+words, <em>their lifetime is bound to the lifetime of this outermost object</em>.
+Let’s call this outermost object the <strong>lifetime anchor</strong>.</li>
+<li>the lifetime anchor must inherit from <code>std::enable_shared_from_this</code> and pass
+<code>std::weak_from_this()</code> to all the nested objects that are asynchronous.
+Let’s call this <em>weak lifetime</em>.</li>
+<li>any <code>sigc::signal</code> (or similar) callbacks (e.g. perhaps called from
+independent objects rather than member objects i.e. objects whose lifetime
+is not bound to the lifetime anchor), must guard their calls by locking
+the <code>weak_lifetime</code>. If expired, return early.</li>
+<li>any handlers scheduled via asio objects, must lock the weak pointer BEFORE
+the handler gets registered, turning the <em>weak lifetime</em> into a <em>strong lifetime</em>.
+The lambda captures the strong-lifetime by value. This ensures the outermost
+object (the lifetime anchor) as well as all its nested objects are alive
+when the handler runs.</li>
+<li>store required <code>shared_ptr</code> dependencies such as
+<code>std::shared_ptr&lt;asio::io_context&gt;</code> in the lifetime anchor only, thus
+avoiding repeated overhead (beyond storing the <code>weak_lifetime</code>
+<code>std::weak_ptr</code>).</li>
+</ul>
+<p>The above has been abstracted into a <a href="https://github.com/dcrisn/lifetime_utils">single-header set of utilities</a>
+that reduces boilerplate and provides meaningful names so that the pattern is
+obvious at the point of application. The ‘outermost class’ is to inherit from a
+<code>lifetime_anchor</code> class (which inherits from <code>std::enable_shared_from_this</code>).
+This provides various members such as <code>guard_lifetime()</code> and <code>bind_lifetime()</code>.
+These also have corresponding free-function versions that take <code>weak_lifetime</code>
+as a parameter.</p>
+<h3 id="guard-lifetime"><code>guard_lifetime()</code></h3>
+<p><code>guard_lifetime(&lt;callback&gt;)</code> wraps its callback argument into another lambda
+that takes care of capturing the <code>weak_lifetime</code> (weak pointer to the
+<code>lifetime_anchor</code> i.e. the outermost object whose lifetime all the nested
+objects’ lifetimes are bound to) and only invoking the callback if the weak
+pointer can be locked. In fact, there is an additional layer here: the lifetime
+also has a method to check for <em>logical</em> validity. So only if the <code>weak_ptr</code>
+to the lifetime can be locked (physical lifetime validity), AND the lifetime
+is ‘valid’, does the lambda get invoked.</p>
+<p>Logical validity is based on keeping an internal ‘version’ counter. Callbacks
+will be associated with a version value at the time of creation. At the time
+of invocation, the callback’s version value is checked against the current
+version of the lifetime. Additionally, one specific value of the version
+counter is used as a flag, indicating permanent lifetime invalidation.
+Once permanently invalidated, the version never changes and the lifetime is
+logically ended, permanently. Otherwise the lifetime can increment its version
+every time it wants to prevent previously scheduled callbacks from executing.
+The version idea is somewhat similar to version vectors in distributed systems
+to detect read-write conflicts.</p>
+<p>Therefore, a given callback is only invoked if:</p>
+<ol>
+<li>the lifetime is still physically alive (weak pointer can be locked), and</li>
+<li>the lifetime version is not set to the permanently-invalid flag value, and</li>
+<li>the version associated with the callback is the same as the current version
+of the lifetime.</li>
+</ol>
+<h3 id="bind-lifetime"><code>bind_lifetime()</code></h3>
+<p><code>bind_lifetime(&lt;callback&gt;)</code> does the same as <code>guard_lifetime()</code>, but it
+captures the lifetime anchor as a <code>shared_ptr</code> (a <em>strong lifetime</em>). Therefore
+this is the function to be used with asio objects where not only do we want
+to guard against a callback being invoked if the lifetime is gone, but actually
+guarantee the lifetime is not gone until the callback has been invoked.</p>
+<h2 id="the-lifetime-pattern-applied">The Lifetime Pattern Applied</h2>
+<p>The initial example is now rewritten using the lifetime utilities for
+demonstration.</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#6c7079;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#cd74e8;">#include </span><span style="color:#9acc76;">&quot;lifetime_utils.hpp&quot;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">#include </span><span style="color:#9acc76;">&lt;boost/asio.hpp&gt;
+</span><span style="color:#cd74e8;">#include </span><span style="color:#9acc76;">&lt;boost/asio/posix/basic_stream_descriptor.hpp&gt;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">#include </span><span style="color:#9acc76;">&lt;sigc++/signal.h&gt;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">using namespace</span><span style="color:#abb2bf;"> std::chrono_literals;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">namespace </span><span style="color:#abb2bf;">asio </span><span style="color:#adb7c9;">=</span><span style="color:#abb2bf;"> boost::asio;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">class </span><span style="color:#f0c678;">connection </span><span style="color:#adb7c9;">{
+</span><span style="color:#cd74e8;">public</span><span style="color:#adb7c9;">:
+</span><span style="color:#adb7c9;">    </span><span style="color:#5cb3fa;">connection</span><span style="color:#adb7c9;">(asio::io_context &amp;</span><span style="color:#eb6772;">ioctx</span><span style="color:#adb7c9;">, weak_lifetime_t </span><span style="color:#eb6772;">lifetime</span><span style="color:#adb7c9;">)
+</span><span style="color:#adb7c9;">        : </span><span style="color:#eb6772;">m_lifetime</span><span style="color:#adb7c9;">(std::</span><span style="color:#eb6772;">move</span><span style="color:#adb7c9;">(lifetime)), </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">(ioctx) {}
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">start</span><span style="color:#adb7c9;">() { </span><span style="color:#eb6772;">restart_heartbeat_monitor</span><span style="color:#adb7c9;">(); }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">close</span><span style="color:#adb7c9;">() { </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">cancel</span><span style="color:#adb7c9;">(); }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">virtual </span><span style="color:#5cb3fa;">~connection</span><span style="color:#adb7c9;">() { std::cerr &lt;&lt; </span><span style="color:#9acc76;">&quot;connection destroyed</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#adb7c9;">; }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">restart_heartbeat_monitor</span><span style="color:#adb7c9;">() {
+</span><span style="color:#adb7c9;">        </span><span style="font-style:italic;color:#5f697a;">// Any pending async waits will be canceled.
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">expires_after</span><span style="color:#adb7c9;">(</span><span style="color:#eb6772;">m_HEARTBEAT_INTERVAL</span><span style="color:#adb7c9;">);
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">        </span><span style="color:#cd74e8;">const auto</span><span style="color:#adb7c9;"> safe = </span><span style="color:#eb6772;">make_lifetime_binder</span><span style="color:#adb7c9;">(</span><span style="color:#eb6772;">m_lifetime</span><span style="color:#adb7c9;">);
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">        </span><span style="font-style:italic;color:#5f697a;">// call handler on timeout or cancellation
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">async_wait</span><span style="color:#adb7c9;">(</span><span style="color:#eb6772;">safe</span><span style="color:#adb7c9;">([</span><span style="color:#eb6772;">this</span><span style="color:#adb7c9;">](std::error_code ec) {
+</span><span style="color:#adb7c9;">            </span><span style="color:#cd74e8;">if </span><span style="color:#adb7c9;">(ec) {
+</span><span style="color:#adb7c9;">                </span><span style="color:#cd74e8;">if </span><span style="color:#adb7c9;">(ec.</span><span style="color:#eb6772;">value</span><span style="color:#adb7c9;">() != asio::error::operation_aborted) {
+</span><span style="color:#adb7c9;">                    </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">emit</span><span style="color:#adb7c9;">(ec.</span><span style="color:#eb6772;">message</span><span style="color:#adb7c9;">());
+</span><span style="color:#adb7c9;">                }
+</span><span style="color:#adb7c9;">                </span><span style="color:#cd74e8;">return</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">            }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">            </span><span style="color:#eb6772;">on_heartbeat_timeout</span><span style="color:#adb7c9;">();
+</span><span style="color:#adb7c9;">        }));
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">        </span><span style="font-style:italic;color:#5f697a;">// NOTE: the above can also be written as:
+</span><span style="color:#adb7c9;">        </span><span style="font-style:italic;color:#5f697a;">// m_timer.async_wait(bind_lifetime(m_lifetime, &lt;LAMBDA&gt;));
+</span><span style="color:#adb7c9;">    };
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">on_heartbeat_received</span><span style="color:#adb7c9;">() {
+</span><span style="color:#adb7c9;">        std::cerr &lt;&lt; </span><span style="color:#9acc76;">&quot;Heartbeat received, restarting monitor.&quot; </span><span style="color:#adb7c9;">&lt;&lt; std::endl;
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">restart_heartbeat_monitor</span><span style="color:#adb7c9;">();
+</span><span style="color:#adb7c9;">    }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">on_heartbeat_timeout</span><span style="color:#adb7c9;">() {
+</span><span style="color:#adb7c9;">        std::cerr &lt;&lt; </span><span style="color:#9acc76;">&quot;heartbeat timeout!!</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">close</span><span style="color:#adb7c9;">();
+</span><span style="color:#adb7c9;">    }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">static auto </span><span style="color:#5cb3fa;">heartbeat_interval</span><span style="color:#adb7c9;">() { </span><span style="color:#cd74e8;">return </span><span style="color:#eb6772;">m_HEARTBEAT_INTERVAL</span><span style="color:#adb7c9;">; }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#5cb3fa;">signal_error</span><span style="color:#adb7c9;">() { </span><span style="color:#cd74e8;">return </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#adb7c9;">; }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#cd74e8;">private</span><span style="color:#adb7c9;">:
+</span><span style="color:#adb7c9;">    weak_lifetime_t </span><span style="color:#eb6772;">m_lifetime</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">static inline constexpr</span><span style="color:#adb7c9;"> std::chrono::milliseconds m_HEARTBEAT_INTERVAL {
+</span><span style="color:#adb7c9;">      </span><span style="color:#db9d63;">100</span><span style="color:#adb7c9;">};
+</span><span style="color:#adb7c9;">    boost::asio::high_resolution_timer </span><span style="color:#eb6772;">m_timer</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">    sigc::signal&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#adb7c9;">(</span><span style="color:#cd74e8;">const</span><span style="color:#adb7c9;"> std::string &amp;)&gt; </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">}</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">class </span><span style="color:#f0c678;">connection_wrapper </span><span style="color:#adb7c9;">: </span><span style="color:#cd74e8;">public </span><span style="color:#9acc76;">lifetime_anchor_tu </span><span style="color:#adb7c9;">{
+</span><span style="color:#cd74e8;">public</span><span style="color:#adb7c9;">:
+</span><span style="color:#adb7c9;">    </span><span style="color:#5cb3fa;">connection_wrapper</span><span style="color:#adb7c9;">(std::shared_ptr&lt;asio::io_context&gt; </span><span style="color:#eb6772;">ioctx</span><span style="color:#adb7c9;">)
+</span><span style="color:#adb7c9;">        : </span><span style="color:#eb6772;">m_ioctx</span><span style="color:#adb7c9;">(std::</span><span style="color:#eb6772;">move</span><span style="color:#adb7c9;">(ioctx)) {}
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">void </span><span style="color:#5cb3fa;">construct</span><span style="color:#adb7c9;">() </span><span style="color:#cd74e8;">override </span><span style="color:#adb7c9;">{
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">m_conn</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">construct</span><span style="color:#adb7c9;">(*</span><span style="color:#eb6772;">m_ioctx</span><span style="color:#adb7c9;">, </span><span style="color:#eb6772;">weak_lifetime</span><span style="color:#adb7c9;">());
+</span><span style="color:#adb7c9;">        </span><span style="color:#eb6772;">m_conn</span><span style="color:#adb7c9;">-&gt;</span><span style="color:#eb6772;">signal_error</span><span style="color:#adb7c9;">().</span><span style="color:#eb6772;">connect</span><span style="color:#adb7c9;">(</span><span style="color:#eb6772;">guard_lifetime</span><span style="color:#adb7c9;">([</span><span style="color:#eb6772;">this</span><span style="color:#adb7c9;">](</span><span style="color:#cd74e8;">const auto </span><span style="color:#adb7c9;">&amp;e) {
+</span><span style="color:#adb7c9;">            std::cerr &lt;&lt; </span><span style="color:#9acc76;">&quot;ERROR: &quot; </span><span style="color:#adb7c9;">&lt;&lt; e &lt;&lt; std::endl;
+</span><span style="color:#adb7c9;">            </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#adb7c9;">.</span><span style="color:#eb6772;">emit</span><span style="color:#adb7c9;">(e);
+</span><span style="color:#adb7c9;">        }));
+</span><span style="color:#adb7c9;">    }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    </span><span style="color:#cd74e8;">auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#5cb3fa;">conn</span><span style="color:#adb7c9;">() { </span><span style="color:#cd74e8;">return </span><span style="color:#adb7c9;">*</span><span style="color:#eb6772;">m_conn</span><span style="color:#adb7c9;">; }
+</span><span style="color:#adb7c9;">
+</span><span style="color:#cd74e8;">private</span><span style="color:#adb7c9;">:
+</span><span style="color:#adb7c9;">    std::shared_ptr&lt;asio::io_context&gt; </span><span style="color:#eb6772;">m_ioctx</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">
+</span><span style="color:#adb7c9;">    delayed_construction&lt;connection&gt; </span><span style="color:#eb6772;">m_conn</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">    sigc::signal&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#adb7c9;">(</span><span style="color:#cd74e8;">const</span><span style="color:#adb7c9;"> std::string &amp;e)&gt; </span><span style="color:#eb6772;">m_sig_error</span><span style="color:#adb7c9;">;
+</span><span style="color:#adb7c9;">}</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#cd74e8;">int </span><span style="color:#5cb3fa;">main</span><span style="color:#abb2bf;">(</span><span style="color:#eb6772;">int</span><span style="color:#abb2bf;">, </span><span style="color:#cd74e8;">const char </span><span style="color:#adb7c9;">**</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">using </span><span style="color:#abb2bf;">connection_id_t </span><span style="color:#adb7c9;">=</span><span style="color:#abb2bf;"> std::uint32_t;
+</span><span style="color:#abb2bf;">    std::map&lt;connection_id_t, std::shared_ptr&lt;connection_wrapper&gt;&gt; live_conns;
+</span><span style="color:#abb2bf;">    std::uint32_t next_connection_id </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">constexpr</span><span style="color:#abb2bf;"> std::size_t NUM_CONNS </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">2</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">unsigned</span><span style="color:#abb2bf;"> NUM_HEARTBEATS </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">5</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">auto</span><span style="color:#abb2bf;"> ioctx </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">make_shared</span><span style="color:#abb2bf;">&lt;asio::io_context&gt;();
+</span><span style="color:#abb2bf;">    asio::high_resolution_timer </span><span style="color:#eb6772;">heartbeat_pump_timer </span><span style="color:#abb2bf;">{</span><span style="color:#adb7c9;">*</span><span style="color:#abb2bf;">ioctx};
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">const</span><span style="color:#abb2bf;"> std::function&lt;</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">void</span><span style="color:#abb2bf;">)&gt; wait_send_next_heartbeat </span><span style="color:#adb7c9;">=
+</span><span style="color:#abb2bf;">      [</span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">live_conns,
+</span><span style="color:#abb2bf;">       </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">timer </span><span style="color:#adb7c9;">=</span><span style="color:#abb2bf;"> heartbeat_pump_timer,
+</span><span style="color:#abb2bf;">       </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">wait_send_next_heartbeat,
+</span><span style="color:#abb2bf;">       </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">NUM_HEARTBEATS] {
+</span><span style="color:#abb2bf;">          </span><span style="font-style:italic;color:#5f697a;">// we only send NUM_HEARTBEATS; after that we make
+</span><span style="color:#abb2bf;">          </span><span style="font-style:italic;color:#5f697a;">// a close on the connection and throw it away.
+</span><span style="color:#abb2bf;">          std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;num heartbeats is &quot; </span><span style="color:#adb7c9;">&lt;&lt;</span><span style="color:#abb2bf;"> NUM_HEARTBEATS </span><span style="color:#adb7c9;">&lt;&lt;</span><span style="color:#abb2bf;"> std::endl;
+</span><span style="color:#abb2bf;">          </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(NUM_HEARTBEATS</span><span style="color:#adb7c9;">-- &lt;= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">) {
+</span><span style="color:#abb2bf;">              std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;clearing connections</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">              </span><span style="font-style:italic;color:#5f697a;">// TODO: here, clear only HALF the connections; leaving some
+</span><span style="color:#abb2bf;">              </span><span style="font-style:italic;color:#5f697a;">// alone.
+</span><span style="color:#abb2bf;">              </span><span style="color:#cd74e8;">const auto</span><span style="color:#abb2bf;"> sz </span><span style="color:#adb7c9;">=</span><span style="color:#abb2bf;"> live_conns.</span><span style="color:#eb6772;">size</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">              </span><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">unsigned</span><span style="color:#abb2bf;"> i </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">; i </span><span style="color:#adb7c9;">&lt;</span><span style="color:#abb2bf;"> sz </span><span style="color:#adb7c9;">/ </span><span style="color:#db9d63;">2</span><span style="color:#abb2bf;">; </span><span style="color:#adb7c9;">++</span><span style="color:#abb2bf;">i) {
+</span><span style="color:#abb2bf;">                  std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;invalidating current token!</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">                  live_conns.</span><span style="color:#eb6772;">begin</span><span style="color:#abb2bf;">()-&gt;</span><span style="color:#eb6772;">second</span><span style="color:#abb2bf;">-&gt;</span><span style="color:#eb6772;">set_end_of_life</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">                  live_conns.</span><span style="color:#eb6772;">erase</span><span style="color:#abb2bf;">(live_conns.</span><span style="color:#eb6772;">begin</span><span style="color:#abb2bf;">());
+</span><span style="color:#abb2bf;">              }
+</span><span style="color:#abb2bf;">              </span><span style="color:#cd74e8;">return</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">          }
+</span><span style="color:#abb2bf;">          timer.</span><span style="color:#eb6772;">expires_after</span><span style="color:#abb2bf;">(connection::</span><span style="color:#eb6772;">heartbeat_interval</span><span style="color:#abb2bf;">() </span><span style="color:#adb7c9;">/ </span><span style="color:#db9d63;">2</span><span style="color:#abb2bf;">);
+</span><span style="color:#abb2bf;">          timer.</span><span style="color:#eb6772;">async_wait</span><span style="color:#abb2bf;">(
+</span><span style="color:#abb2bf;">            [</span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">live_conns, </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">wait_send_next_heartbeat](std::error_code ec) {
+</span><span style="color:#abb2bf;">                </span><span style="color:#cd74e8;">if </span><span style="color:#abb2bf;">(ec.</span><span style="color:#eb6772;">value</span><span style="color:#abb2bf;">() </span><span style="color:#adb7c9;">==</span><span style="color:#abb2bf;"> asio::error::operation_aborted) {
+</span><span style="color:#abb2bf;">                    std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;wait_send_next_heartbeat operation aborted</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">                    </span><span style="color:#cd74e8;">return</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">                }
+</span><span style="color:#abb2bf;">                </span><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(</span><span style="color:#cd74e8;">const auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">[connid, wrapper] </span><span style="color:#adb7c9;">:</span><span style="color:#abb2bf;"> live_conns) {
+</span><span style="color:#abb2bf;">                    std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;sending Heartbeat</span><span style="color:#5ebfcc;">\n</span><span style="color:#9acc76;">&quot;</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">                    wrapper-&gt;</span><span style="color:#eb6772;">conn</span><span style="color:#abb2bf;">().</span><span style="color:#eb6772;">on_heartbeat_received</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">                }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">                </span><span style="color:#eb6772;">wait_send_next_heartbeat</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">            });
+</span><span style="color:#abb2bf;">      };
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">for </span><span style="color:#abb2bf;">(std::size_t i </span><span style="color:#adb7c9;">= </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">; i </span><span style="color:#adb7c9;">&lt;</span><span style="color:#abb2bf;"> NUM_CONNS; </span><span style="color:#adb7c9;">++</span><span style="color:#abb2bf;">i) {
+</span><span style="color:#abb2bf;">        </span><span style="color:#cd74e8;">const auto</span><span style="color:#abb2bf;"> id </span><span style="color:#adb7c9;">= ++</span><span style="color:#abb2bf;">next_connection_id;
+</span><span style="color:#abb2bf;">        </span><span style="color:#cd74e8;">auto</span><span style="color:#abb2bf;"> conn </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">make_shared</span><span style="color:#abb2bf;">&lt;connection_wrapper&gt;(ioctx);
+</span><span style="color:#abb2bf;">        conn-&gt;</span><span style="color:#eb6772;">construct</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">        live_conns[id] </span><span style="color:#adb7c9;">= </span><span style="color:#abb2bf;">std::</span><span style="color:#eb6772;">move</span><span style="color:#abb2bf;">(conn);
+</span><span style="color:#abb2bf;">    }
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    std::</span><span style="color:#eb6772;">for_each</span><span style="color:#abb2bf;">(live_conns.</span><span style="color:#eb6772;">begin</span><span style="color:#abb2bf;">(), live_conns.</span><span style="color:#eb6772;">end</span><span style="color:#abb2bf;">(), [](</span><span style="color:#cd74e8;">auto </span><span style="color:#adb7c9;">&amp;</span><span style="color:#abb2bf;">elem) {
+</span><span style="color:#abb2bf;">        elem.</span><span style="color:#eb6772;">second</span><span style="color:#abb2bf;">-&gt;</span><span style="color:#eb6772;">conn</span><span style="color:#abb2bf;">().</span><span style="color:#eb6772;">start</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">    });
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#eb6772;">wait_send_next_heartbeat</span><span style="color:#abb2bf;">();
+</span><span style="color:#abb2bf;">    ioctx-&gt;</span><span style="color:#eb6772;">run_for</span><span style="color:#abb2bf;">(</span><span style="color:#db9d63;">1</span><span style="color:#cd74e8;">s</span><span style="color:#abb2bf;">);
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    std::cerr </span><span style="color:#adb7c9;">&lt;&lt; </span><span style="color:#9acc76;">&quot;NUM nondestructed live_conns: &quot; </span><span style="color:#adb7c9;">&lt;&lt;</span><span style="color:#abb2bf;"> live_conns.</span><span style="color:#eb6772;">size</span><span style="color:#abb2bf;">()
+</span><span style="color:#abb2bf;">              </span><span style="color:#adb7c9;">&lt;&lt;</span><span style="color:#abb2bf;"> std::endl;
+</span><span style="color:#abb2bf;">
+</span><span style="color:#abb2bf;">    </span><span style="color:#cd74e8;">return </span><span style="color:#db9d63;">0</span><span style="color:#abb2bf;">;
+</span><span style="color:#abb2bf;">}
+</span></code></pre>
+<p>There are a number of things to notice:</p>
+<ul>
+<li>the lifetime anchor inherits from the <code>lifetime_anchor</code> base class and by
+extension from <code>std::enable_shared_from_this</code> and must be constructed as a
+<code>shared pointer</code>.</li>
+<li>the lifetime propagates itself as a <code>weak_lifetime</code> to all nested objects
+that require it.</li>
+<li>because the <code>weak_lifetime</code> must be a valid, non-expired, <code>std::weak_ptr</code>
+and because <code>shared_from_this()</code> will <em>not</em> produce such a <code>weak_ptr</code> from
+within the constructor of the lifetime class – because it has not finished
+constructing yet! – those nested objects that must be handed the
+<code>weak_lifetime</code> in their constructor <strong>must have their construction <em>delayed</em></strong>.
+This is done in the example code via the <code>delayed_construction</code> wrapper,
+which constructs its template type parameter as a <code>unique_ptr</code>. In general,
+we may want to put all such members in a struct and construct the struct as
+a <code>unique_ptr</code> to achieve the two-stepped construction necessary.</li>
+<li>the code, in practice, consists of wrapping our callbacks in another lambda
+that captures what is needed and makes the necessary checks to make
+invoking our lambda safe. There are few ways of expressing this, as shown
+in the example. Generally, prefer the one which looks the least intrusive
+i.e. introduces the least amount of noise.</li>
+</ul>
+<h2 id="key-takeaways">Key Takeaways</h2>
+<ul>
+<li>Asio assumes specific lifetime guarantees — violating them leads to subtle
+bugs or UB.</li>
+<li>Use <code>shared_from_this()</code> only when truly necessary; avoid <code>shared_ptr</code>
+proliferation.</li>
+<li>misuse of <code>shared_ptr</code> can produce memory leaks</li>
+<li><code>std::shared_ptr</code> inherently decouples lifetimes, which complicates matters.</li>
+<li>Lifetime coupling can be made explicit using a lifetime anchor pattern,
+and use-after-free bugs can be prevented.</li>
+<li>the lifetime pattern can, for convenience, include a <em>version</em> similar
+in spirit to a simple cancellation token to allow logical invalidation of
+callbacks</li>
+</ul>
+<hr />
+<footer class="footnotes">
+<ol class="footnotes-list">
+<li id="fn-1">
+<p>See <a href="https://web.eecs.umich.edu/~mosharaf/Readings/RPC.pdf">Nelson's early work on RPC</a>.
+The term <code>RPC</code> has become relatively loose to the point of being commonly
+understood simply as referring to the request-response interaction paradigm.
+Originally however, RPC referred strictly to blocking calls made through
+stub-based interfaces that sought to offer <em>location transparency</em>
+by mimicking local <em>procedure calls</em> as closely as possible and hiding the
+underlying network traversal. While the approach over time came to face
+mounting criticism (hence the departure we have seen), it is clear the
+term itself has to some extent lost meaning. <a href="#fr-1-1">↩</a></p>
+</li>
+<li id="fn-2">
+<p>This and generally all the explanations in this section are simplified.
+For example, while <code>epoll</code> offers a <code>reactor</code> API where the application
+is notified of events on file descriptors, <a href="https://think-async.com/Asio/asio-1.19.1/doc/asio/overview/core/async.html"><code>asio</code> and other such libraries
+often offer a callback-based API that is more closely aligned with the
+<code>proactor</code> pattern instead</a>,
+where the callbacks serve not as (level or edge-triggered) event notifiers
+but as <em>completion handlers</em>. <a href="#fr-2-1">↩</a></p>
+</li>
+<li id="fn-3">
+<p>In Linux, following the Unix idea of 'everything is a file', many things
+have been integrated into the file descriptor API such that they can
+be monitored with epoll; including <a href="https://man7.org/linux/man-pages/man2/timerfd_create.2.html">timers</a>,
+<a href="https://man7.org/linux/man-pages/man2/eventfd.2.html">semaphores</a>,
+<a href="https://man7.org/linux/man-pages/man2/eventfd.2.html">signals</a>,
+and <a href="https://man7.org/linux/man-pages/man2/pidfd_open.2.html">processes</a>. <a href="#fr-3-1">↩</a></p>
+</li>
+<li id="fn-4">
+<p><a href="https://wiki.netbsd.org/tutorials/kqueue_tutorial/">NetBSD KQueue tutorial</a> <a href="#fr-4-1">↩</a></p>
+</li>
+<li id="fn-5">
+<p><a href="https://man7.org/linux/man-pages/man7/epoll.7.html">Linux epoll man page</a>. <a href="#fr-5-1">↩</a></p>
+</li>
+<li id="fn-6">
+<p>For example, <a href="https://docs.python.org/3/library/asyncio.html">Python's asyncio module</a>. <a href="#fr-6-1">↩</a></p>
+</li>
+<li id="fn-7">
+<p>NOTE: asio can be used either as <a href="https://think-async.com/Asio/">a standalone library</a>
+or <a href="https://www.boost.org/doc/libs/1_88_0/doc/html/boost_asio.html">as part of boost</a>. <a href="#fr-7-1">↩</a></p>
+</li>
+<li id="fn-8">
+<p>Build configuration e.g. <code>CMakeLists</code> omitted for simplicity.
+For the example I used boost version <code>1.74</code> on an <code>Ubuntu 22.04.5</code>
+<code>x86_64</code> system. <a href="#fr-8-1">↩</a> <a href="#fr-8-2">↩2</a></p>
+</li>
+<li id="fn-9">
+<p><a href="https://libsigcplusplus.github.io/libsigcplusplus/">C++ library implementing type-safe callbacks</a>
+used by <code>gtkmm</code>, <code>inkscape</code> etc. <a href="#fr-9-1">↩</a></p>
+</li>
+<li id="fn-10">
+<p>The <a href="https://en.wikipedia.org/wiki/Observer_pattern">Observer Pattern</a>
+aka <a href="https://en.wikipedia.org/wiki/Signals_and_slots">signals and slots</a>
+etc. <a href="#fr-10-1">↩</a></p>
+</li>
+<li id="fn-11">
+<p><a href="https://github.com/dcrisn/lifetime_utils">lifetime utilities repo</a>. <a href="#fr-11-1">↩</a></p>
+</li>
+</ol>
+</footer>
+
+
         
     </article>
 
